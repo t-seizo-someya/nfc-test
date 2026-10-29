@@ -1,57 +1,161 @@
 <!DOCTYPE html>
-<html>
+<html lang="ja">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NFC診断</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>棚卸</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 16px; font-size: 18px; }
+  button { font-size: 20px; padding: 14px 20px; margin: 4px 0; }
+  input { font-size: 24px; padding: 10px; width: 100%; box-sizing: border-box; margin: 4px 0; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin: 12px 0; }
+  #code { font-size: 32px; font-weight: bold; }
+  #warn { color: #c00; font-weight: bold; }
+  #status { color: #555; white-space: pre-wrap; }
+  .hide { display: none; }
+</style>
 </head>
-<body style="font-family:sans-serif; padding:16px;">
-  <h2>NFC診断</h2>
-  <pre id="env" style="white-space:pre-wrap;"></pre>
-  <button id="btn" style="font-size:20px; padding:12px 24px;">スキャン開始</button>
-  <pre id="log" style="font-size:16px; white-space:pre-wrap;"></pre>
+<body>
+<h2>棚卸</h2>
 
-  <script>
-    const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
-    let ctrl = null;
+<details id="setup">
+  <summary>端末設定</summary>
+  <input id="gasUrl" placeholder="GASのURL（…/exec）">
+  <input id="token" placeholder="合言葉">
+  <input id="device" placeholder="端末名（例：棚卸1号）">
+  <button id="saveSetup">設定を保存</button>
+</details>
 
-    document.getElementById('env').textContent =
-      'UA: ' + navigator.userAgent + '\n' +
-      'NDEFReader: ' + ('NDEFReader' in window) + '\n' +
-      'secure: ' + window.isSecureContext + '\n' +
-      'iframe内: ' + (window.top !== window.self) + '\n' +
-      'visibility: ' + document.visibilityState;
+<button id="start">スキャン開始</button>
+<div id="status"></div>
 
-    (async () => {
-      try {
-        const p = await navigator.permissions.query({ name: 'nfc' });
-        document.getElementById('env').textContent += '\nNFC権限: ' + p.state;
-      } catch (e) {
-        document.getElementById('env').textContent += '\nNFC権限の取得失敗: ' + e.name;
-      }
-    })();
+<div class="card hide" id="panel">
+  <div>品番</div>
+  <div id="code"></div>
+  <div id="warn"></div>
+  <input id="qty" type="number" inputmode="numeric" min="0" placeholder="数量">
+  <button id="ok">確定</button>
+  <button id="cancel">キャンセル</button>
+</div>
 
-    document.getElementById('btn').addEventListener('click', async () => {
-      try {
-        if (ctrl) ctrl.abort();
-        ctrl = new AbortController();
-        const reader = new NDEFReader();
-        reader.onreadingerror = () => log('読み取りエラー');
-        reader.onreading = (e) => {
-          log('シリアル: ' + e.serialNumber);
-          for (const rec of e.message.records) {
-            log('種別: ' + rec.recordType);
-            if (rec.recordType === 'text') {
-              log('テキスト: ' + new TextDecoder(rec.encoding || 'utf-8').decode(rec.data));
-            }
-          }
-        };
-        await reader.scan({ signal: ctrl.signal });
-        log('スキャン開始。タグをかざしてください');
-      } catch (err) {
-        log('失敗: ' + err.name + ' / ' + err.message);
-      }
-    });
-  </script>
+<div id="queueInfo"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d = '') { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} }
+};
+
+let queue = JSON.parse(store.get('queue', '[]'));   // 未送信
+let counted = JSON.parse(store.get('counted', '{}')); // 端末内で登録済みの品番→数量
+let current = null;
+let flushing = false;
+let ctrl = null;
+
+const setStatus = m => { $('status').textContent = m; };
+const saveLocal = () => {
+  store.set('queue', JSON.stringify(queue));
+  store.set('counted', JSON.stringify(counted));
+  $('queueInfo').textContent = '未送信: ' + queue.length + '件 / 登録済み品番: ' + Object.keys(counted).length;
+};
+
+// 設定
+$('gasUrl').value = store.get('gasUrl');
+$('token').value = store.get('token');
+$('device').value = store.get('device');
+if (!store.get('gasUrl')) $('setup').open = true;
+$('saveSetup').onclick = () => {
+  store.set('gasUrl', $('gasUrl').value.trim());
+  store.set('token', $('token').value.trim());
+  store.set('device', $('device').value.trim());
+  setStatus('設定を保存しました');
+  flush();
+};
+
+// 送信（失敗したら端末に残して再送）
+async function flush() {
+  const url = store.get('gasUrl');
+  if (flushing || !queue.length || !url) return;
+  flushing = true;
+  try {
+    while (queue.length) {
+      const batch = queue.slice(0, 50);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' }, // CORSの事前確認を避ける
+        body: JSON.stringify({ token: store.get('token'), device: store.get('device'), records: batch })
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'send failed');
+      queue = queue.slice(batch.length);
+      saveLocal();
+    }
+  } catch (e) {
+    setStatus('送信待ち（通信を再試行します）: ' + e.message);
+  } finally {
+    flushing = false;
+    saveLocal();
+  }
+}
+setInterval(flush, 15000);
+window.addEventListener('online', flush);
+
+// 読み取り
+function showPanel(code) {
+  current = code;
+  $('code').textContent = code;
+  $('warn').textContent = (code in counted)
+    ? 'すでに ' + counted[code] + ' 個で登録済み。確定すると上書きします'
+    : '';
+  $('qty').value = '';
+  $('panel').classList.remove('hide');
+  $('qty').focus();
+  if (navigator.vibrate) navigator.vibrate(80);
+}
+
+$('start').onclick = async () => {
+  try {
+    if (ctrl) ctrl.abort();
+    ctrl = new AbortController();
+    const reader = new NDEFReader();
+    reader.onreadingerror = () => setStatus('読み取りエラー：もう一度かざしてください');
+    reader.onreading = e => {
+      const rec = e.message.records.find(r => r.recordType === 'text');
+      if (!rec) { setStatus('品番のテキストが入っていないタグです'); return; }
+      const code = new TextDecoder(rec.encoding || 'utf-8').decode(rec.data).trim();
+      if (code) showPanel(code);
+    };
+    await reader.scan({ signal: ctrl.signal });
+    setStatus('スキャン中です。タグをかざしてください');
+    if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {});
+  } catch (err) {
+    setStatus('失敗: ' + err.name + ' / ' + err.message);
+  }
+};
+
+// 確定
+function commit() {
+  if (!current) return;
+  const qty = Number($('qty').value);
+  if ($('qty').value === '' || !Number.isFinite(qty) || qty < 0) {
+    setStatus('数量を入力してください');
+    return;
+  }
+  queue.push({ id: crypto.randomUUID(), ts: new Date().toISOString(), code: current, qty });
+  counted[current] = qty;
+  saveLocal();
+  setStatus(current + ' → ' + qty + ' を登録しました');
+  $('panel').classList.add('hide');
+  current = null;
+  flush();
+}
+$('ok').onclick = commit;
+$('qty').addEventListener('keydown', e => { if (e.key === 'Enter') commit(); });
+$('cancel').onclick = () => { $('panel').classList.add('hide'); current = null; };
+
+saveLocal();
+flush();
+</script>
 </body>
 </html>
