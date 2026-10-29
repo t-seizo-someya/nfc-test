@@ -13,6 +13,9 @@
   #warn { color: #c00; font-weight: bold; }
   #status { color: #555; white-space: pre-wrap; }
   .hide { display: none; }
+  .sub { font-size: 16px; padding: 10px 14px; }
+  .danger { color: #c00; }
+  hr { margin: 20px 0; }
 </style>
 </head>
 <body>
@@ -20,8 +23,8 @@
 
 <details id="setup">
   <summary>端末設定</summary>
-  <input id="gasUrl" placeholder="GASのURL（…/exec）">
-  <input id="token" placeholder="合言葉">
+  <input id="gasUrl" placeholder="GASのURL（…/exec）※空欄なら端末内保存のみ">
+  <input id="token" placeholder="合言葉（GAS送信時のみ）">
   <input id="device" placeholder="端末名（例：棚卸1号）">
   <button id="saveSetup">設定を保存</button>
 </details>
@@ -38,7 +41,13 @@
   <button id="cancel">キャンセル</button>
 </div>
 
-<div id="queueInfo"></div>
+<div id="info"></div>
+
+<hr>
+<h3>データの書き出し</h3>
+<button id="csvLatest">CSVを書き出す（品番ごとの最新数量）</button><br>
+<button id="csvAll" class="sub">全履歴をCSVで書き出す</button><br>
+<button id="clearAll" class="sub danger">端末のデータを消去</button>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -47,33 +56,41 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} }
 };
 
-let queue = JSON.parse(store.get('queue', '[]'));   // 未送信
-let counted = JSON.parse(store.get('counted', '{}')); // 端末内で登録済みの品番→数量
+let log = JSON.parse(store.get('log', '[]'));     // 全件（消えない）
+let queue = JSON.parse(store.get('queue', '[]')); // GAS未送信分
+if (!log.length && queue.length) log = queue.slice(); // 旧版からの引き継ぎ
 let current = null;
 let flushing = false;
 let ctrl = null;
 
 const setStatus = m => { $('status').textContent = m; };
-const saveLocal = () => {
+const countedMap = () => { const m = {}; log.forEach(r => { m[r.code] = r.qty; }); return m; };
+
+function saveLocal() {
+  store.set('log', JSON.stringify(log));
   store.set('queue', JSON.stringify(queue));
-  store.set('counted', JSON.stringify(counted));
-  $('queueInfo').textContent = '未送信: ' + queue.length + '件 / 登録済み品番: ' + Object.keys(counted).length;
-};
+  const codes = Object.keys(countedMap()).length;
+  let t = '登録: ' + log.length + '件（品番 ' + codes + '種）';
+  if (store.get('gasUrl')) t += ' / GAS未送信: ' + queue.length + '件';
+  else t += ' / GAS未設定（端末内保存のみ）';
+  $('info').textContent = t;
+}
 
 // 設定
 $('gasUrl').value = store.get('gasUrl');
 $('token').value = store.get('token');
 $('device').value = store.get('device');
-if (!store.get('gasUrl')) $('setup').open = true;
+if (!store.get('device')) $('setup').open = true;
 $('saveSetup').onclick = () => {
   store.set('gasUrl', $('gasUrl').value.trim());
   store.set('token', $('token').value.trim());
   store.set('device', $('device').value.trim());
   setStatus('設定を保存しました');
+  saveLocal();
   flush();
 };
 
-// 送信（失敗したら端末に残して再送）
+// GASへ送信（URLが空なら何もしない）
 async function flush() {
   const url = store.get('gasUrl');
   if (flushing || !queue.length || !url) return;
@@ -83,7 +100,7 @@ async function flush() {
       const batch = queue.slice(0, 50);
       const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain' }, // CORSの事前確認を避ける
+        headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({ token: store.get('token'), device: store.get('device'), records: batch })
       });
       const data = await res.json();
@@ -92,7 +109,7 @@ async function flush() {
       saveLocal();
     }
   } catch (e) {
-    setStatus('送信待ち（通信を再試行します）: ' + e.message);
+    setStatus('GAS送信待ち（端末には保存済み）: ' + e.message);
   } finally {
     flushing = false;
     saveLocal();
@@ -104,9 +121,10 @@ window.addEventListener('online', flush);
 // 読み取り
 function showPanel(code) {
   current = code;
+  const m = countedMap();
   $('code').textContent = code;
-  $('warn').textContent = (code in counted)
-    ? 'すでに ' + counted[code] + ' 個で登録済み。確定すると上書きします'
+  $('warn').textContent = (code in m)
+    ? 'すでに ' + m[code] + ' 個で登録済み。確定すると上書きします'
     : '';
   $('qty').value = '';
   $('panel').classList.remove('hide');
@@ -142,8 +160,9 @@ function commit() {
     setStatus('数量を入力してください');
     return;
   }
-  queue.push({ id: crypto.randomUUID(), ts: new Date().toISOString(), code: current, qty });
-  counted[current] = qty;
+  const rec = { id: crypto.randomUUID(), ts: new Date().toISOString(), code: current, qty };
+  log.push(rec);
+  queue.push(rec);
   saveLocal();
   setStatus(current + ' → ' + qty + ' を登録しました');
   $('panel').classList.add('hide');
@@ -153,6 +172,56 @@ function commit() {
 $('ok').onclick = commit;
 $('qty').addEventListener('keydown', e => { if (e.key === 'Enter') commit(); });
 $('cancel').onclick = () => { $('panel').classList.add('hide'); current = null; };
+
+// CSV書き出し
+const pad = n => String(n).padStart(2, '0');
+const fmt = iso => {
+  const d = new Date(iso);
+  return d.getFullYear() + '/' + pad(d.getMonth() + 1) + '/' + pad(d.getDate()) + ' ' +
+         pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+};
+const esc = v => '"' + String(v).replace(/"/g, '""') + '"';
+
+function downloadCsv(kind, rows) {
+  const dev = store.get('device') || '端末';
+  const lines = ['品番,数量,端末,読取日時'];
+  rows.forEach(r => lines.push([esc(r.code), r.qty, esc(dev), esc(fmt(r.ts))].join(',')));
+  const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const now = new Date();
+  const name = '棚卸_' + kind + '_' + dev + '_' + now.getFullYear() + pad(now.getMonth() + 1) +
+               pad(now.getDate()) + '_' + pad(now.getHours()) + pad(now.getMinutes()) + '.csv';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  setStatus('CSVを書き出しました（' + rows.length + '行）\n' + name + '\n端末の「ダウンロード」フォルダを確認してください');
+}
+
+$('csvLatest').onclick = () => {
+  if (!log.length) { setStatus('書き出すデータがありません'); return; }
+  const latest = {};
+  log.forEach(r => { latest[r.code] = r; }); // 同じ品番は最後の登録が有効
+  const rows = Object.keys(latest).sort().map(k => latest[k]);
+  downloadCsv('最新', rows);
+};
+$('csvAll').onclick = () => {
+  if (!log.length) { setStatus('書き出すデータがありません'); return; }
+  downloadCsv('全履歴', log);
+};
+
+// 消去
+$('clearAll').onclick = () => {
+  const msg = '端末内の登録データ ' + log.length + '件をすべて消去します。\n' +
+              'CSVの書き出しや、GASへの送信は済んでいますか？\n（元には戻せません）';
+  if (!confirm(msg)) return;
+  log = [];
+  queue = [];
+  saveLocal();
+  setStatus('端末のデータを消去しました');
+};
 
 saveLocal();
 flush();
