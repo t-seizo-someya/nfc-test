@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFC診断</title>
+</head>
+<body style="font-family:sans-serif; padding:16px;">
+  <h2>NFC診断</h2>
+  <pre id="env" style="white-space:pre-wrap;"></pre>
+  <button id="btn" style="font-size:20px; padding:12px 24px;">スキャン開始</button>
+  <pre id="log" style="font-size:16px; white-space:pre-wrap;"></pre>
+
+  <script>
+    const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
+    let ctrl = null;
+
+    document.getElementById('env').textContent =
+      'UA: ' + navigator.userAgent + '\n' +
+      'NDEFReader: ' + ('NDEFReader' in window) + '\n' +
+      'secure: ' + window.isSecureContext + '\n' +
+      'iframe内: ' + (window.top !== window.self) + '\n' +
+      'visibility: ' + document.visibilityState;
+
+    (async () => {
+      try {
+        const p = await navigator.permissions.query({ name: 'nfc' });
+        document.getElementById('env').textContent += '\nNFC権限: ' + p.state;
+      } catch (e) {
+        document.getElementById('env').textContent += '\nNFC権限の取得失敗: ' + e.name;
+      }
+    })();
+
+    document.getElementById('btn').addEventListener('click', async () => {
+      try {
+        if (ctrl) ctrl.abort();
+        ctrl = new AbortController();
+        const reader = new NDEFReader();
+        reader.onreadingerror = () => log('読み取りエラー');
+        reader.onreading = (e) => {
+          log('シリアル: ' + e.serialNumber);
+          for (const rec of e.message.records) {
+            log('種別: ' + rec.recordType);
+            if (rec.recordType === 'text') {
+              log('テキスト: ' + new TextDecoder(rec.encoding || 'utf-8').decode(rec.data));
+            }
+          }
+        };
+        await reader.scan({ signal: ctrl.signal });
+        log('スキャン開始。タグをかざしてください');
+      } catch (err) {
+        log('失敗: ' + err.name + ' / ' + err.message);
+      }
+    });
+  </script>
+</body>
+</html>
